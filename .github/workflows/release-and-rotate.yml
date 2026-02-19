@@ -19,7 +19,7 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # IMPORTANT: On récupère tout l'historique
+          fetch-depth: 0
 
       - name: Configuration de Git
         run: |
@@ -30,95 +30,63 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # =========================================================
           # 1. RÉCUPÉRATION DE LA BRANCHE FUSIONNÉE
-          # =========================================================
           MERGED_BRANCH="${{ github.event.pull_request.head.ref }}"
-          
-          if [[ "$MERGED_BRANCH" != v* ]]; then
-            echo "La branche fusionnée ($MERGED_BRANCH) ne commence pas par 'v'. Arrêt du script."
+          if [[ ! "$MERGED_BRANCH" =~ ^v?[0-9] ]]; then
+            echo "La branche $MERGED_BRANCH n'est pas une version. Arrêt."
             exit 0
           fi
-          echo "Branche fusionnée détectée : $MERGED_BRANCH"
 
-          # =========================================================
           # 2. CRÉATION DE LA RELEASE (TAG)
-          # =========================================================
-          echo "Création de la Release GitHub..."
-          gh release create "$MERGED_BRANCH" --title "Version $MERGED_BRANCH" --generate-notes --target main
+          TAG_NAME="$MERGED_BRANCH"
+          [[ "$TAG_NAME" != v* ]] && TAG_NAME="v$TAG_NAME"
+          echo "Création de la Release : $TAG_NAME"
+          gh release create "$TAG_NAME" --title "Version $TAG_NAME" --generate-notes --target main
 
-          # =========================================================
-          # 3. DÉTERMINATION DU NOM DE LA NOUVELLE BRANCHE
-          # =========================================================
-          echo "Lecture du fichier NEXT_VERSION.txt..."
-          
-          # Initialisation de la variable
-          NEXT_VERSION_FROM_FILE=""
-          
-          # On essaie de lire le fichier s'il existe
+          # 3. LECTURE / CALCUL DE LA NOUVELLE BRANCHE (N)
           if [ -f "NEXT_VERSION.txt" ]; then
-            NEXT_VERSION_FROM_FILE=$(cat NEXT_VERSION.txt | tr -d '[:space:]')
+            NEW_BRANCH=$(cat NEXT_VERSION.txt | tr -d '[:space:]')
           fi
 
-          # LOGIQUE DE SÉCURITÉ :
-          # Si le fichier est vide OU s'il contient encore l'ancienne version
-          if [[ -z "$NEXT_VERSION_FROM_FILE" || "$NEXT_VERSION_FROM_FILE" == "$MERGED_BRANCH" ]]; then
-            echo "⚠️ ATTENTION : Le fichier NEXT_VERSION contient '$NEXT_VERSION_FROM_FILE' (identique à la version actuelle ou vide)."
-            echo "👉 Passage en mode AUTO-INCRÉMENTATION."
-          
-            # Logique mathématique pour vX.Y -> vX.(Y+1)
-            # 1. On enlève le "v"
-            VERSION_NUM="${MERGED_BRANCH#v}"
-            # 2. On sépare Majeur et Mineur (basé sur le point)
-            MAJOR="${VERSION_NUM%%.*}"
-            MINOR="${VERSION_NUM##*.}"
-            # 3. On incrémente le Mineur
+          if [[ -z "$NEW_BRANCH" || "$NEW_BRANCH" == "$MERGED_BRANCH" ]]; then
+            echo "👉 Mode Auto-incrémentation."
+            VERSION_CLEAN="${MERGED_BRANCH#v}"
+            MAJOR="${VERSION_CLEAN%%.*}"
+            MINOR="${VERSION_CLEAN##*.}"
             NEW_MINOR=$((MINOR + 1))
-            # 4. On reconstruit
-            NEW_BRANCH="v${MAJOR}.${NEW_MINOR}"
-          else
-            echo "✅ Fichier NEXT_VERSION valide."
-            NEW_BRANCH="$NEXT_VERSION_FROM_FILE"
+            NEW_BRANCH="$([[ "$MERGED_BRANCH" == v* ]] && echo "v")${MAJOR}.${NEW_MINOR}"
           fi
 
-          echo "🎯 La future branche de dev sera : $NEW_BRANCH"
-
-          # =========================================================
-          # 4. CRÉATION DE LA NOUVELLE BRANCHE DE DEV
-          # =========================================================
-          echo "Préparation de la création de branche..."
-          
-          # CORRECTION CRITIQUE : On s'assure d'avoir les dernières infos distantes
+          # 4. CRÉATION DE LA NOUVELLE BRANCHE (N)
           git fetch origin main
-          
-          # On se place explicitement sur main (reset hard pour être sûr d'être propre)
           git checkout -B main origin/main
-          
-          # On crée la branche
           git checkout -b "$NEW_BRANCH"
-          
-          # On la pousse
-          echo "Push de la branche $NEW_BRANCH vers origin..."
           git push origin "$NEW_BRANCH"
 
-          # =========================================================
-          # 5. NETTOYAGE DES ANCIENNES BRANCHES
-          # =========================================================
-          echo "Nettoyage des vieilles branches..."
-          # Liste des branches distantes v* triées par version décroissante
-          BRANCHES=$(git branch -r --list "origin/v*" | sed 's/  origin\///' | sort -rV)
+          # 5. NETTOYAGE (SUPRESSION N-2 ET INFÉRIEUR)
+          echo "🧹 Début du nettoyage..."
+          
+          # On force un fetch complet de toutes les branches pour que le runner 'voie' tout
+          git fetch --all --prune
+          
+          # On liste les branches distantes, on nettoie proprement le texte 'origin/' 
+          # et on ne garde que ce qui ressemble à une version (ex: v1.1 ou 1.1)
+          RAW_LIST=$(git branch -r | sed 's|.*origin/||' | grep -E "^v?[0-9]" | grep -vE "^main$|^master$")
+          
+          # Tri par version décroissante (v1.3, v1.2, v1.1...)
+          BRANCHES=$(echo "$RAW_LIST" | sort -rV)
           BRANCH_ARRAY=($BRANCHES)
           
-          # On garde les 2 plus récentes (l'actuelle N et la précédente N-1)
+          echo "Liste triée des branches de version sur le serveur :"
+          echo "${BRANCH_ARRAY[@]}"
+
+          # i=0 (N), i=1 (N-1). On supprime tout à partir de i=2 (N-2)
           if [ ${#BRANCH_ARRAY[@]} -gt 2 ]; then
             for (( i=2; i<${#BRANCH_ARRAY[@]}; i++ )); do
-              BRANCH_TO_DELETE="${BRANCH_ARRAY[$i]}"
-              # Petite sécurité pour ne jamais supprimer main ou master par accident
-              if [[ "$BRANCH_TO_DELETE" != "main" && "$BRANCH_TO_DELETE" != "master" ]]; then
-                echo "Suppression de l'ancienne branche : $BRANCH_TO_DELETE"
-                git push origin --delete "$BRANCH_TO_DELETE"
-              fi
+              TO_DELETE="${BRANCH_ARRAY[$i]}"
+              echo "🗑️ Suppression de l'ancienne branche (N-2+) : $TO_DELETE"
+              git push origin --delete "$TO_DELETE"
             done
           else
-            echo "Rien à nettoyer (2 branches ou moins détectées)."
+            echo "✅ Rien à supprimer. On garde : ${BRANCH_ARRAY[*]}"
           fi
