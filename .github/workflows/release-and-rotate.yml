@@ -1,4 +1,4 @@
-name: release-and-rotate.yml
+name: Release et Rotation des Branches
 
 on:
   pull_request:
@@ -7,7 +7,6 @@ on:
     branches:
       - main
 
-# Autorisations nécessaires pour que le bot GitHub puisse pousser du code et créer des releases
 permissions:
   contents: write
   pull-requests: read
@@ -20,80 +19,106 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Récupère tout l'historique pour pouvoir lister les branches
+          fetch-depth: 0 # IMPORTANT: On récupère tout l'historique
 
       - name: Configuration de Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Traitement du Tag, de la Release et des Branches
+      - name: Traitement complet
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # =========================================================
           # 1. RÉCUPÉRATION DE LA BRANCHE FUSIONNÉE
+          # =========================================================
           MERGED_BRANCH="${{ github.event.pull_request.head.ref }}"
           
-          # On vérifie que c'est bien une branche de version (commence par "v")
           if [[ "$MERGED_BRANCH" != v* ]]; then
-            echo "La branche $MERGED_BRANCH ne commence pas par 'v'. Arrêt du script."
+            echo "La branche fusionnée ($MERGED_BRANCH) ne commence pas par 'v'. Arrêt du script."
             exit 0
           fi
-
           echo "Branche fusionnée détectée : $MERGED_BRANCH"
 
-          # ---------------------------------------------------------
-          # 2. CRÉATION DE LA RELEASE SUR GITHUB
-          # ---------------------------------------------------------
-          echo "Création de la Release GitHub pour $MERGED_BRANCH..."
-          # L'outil 'gh' crée le tag sur main et génère une page de Release avec les notes automatiques
+          # =========================================================
+          # 2. CRÉATION DE LA RELEASE (TAG)
+          # =========================================================
+          echo "Création de la Release GitHub..."
           gh release create "$MERGED_BRANCH" --title "Version $MERGED_BRANCH" --generate-notes --target main
 
-          # ---------------------------------------------------------
-          # 3. LECTURE DU NOM DE LA NOUVELLE BRANCHE
-          # ---------------------------------------------------------
+          # =========================================================
+          # 3. DÉTERMINATION DU NOM DE LA NOUVELLE BRANCHE
+          # =========================================================
           echo "Lecture du fichier NEXT_VERSION.txt..."
           
-          # On vérifie que le fichier existe bien pour éviter un plantage
-          if [ ! -f "NEXT_VERSION.txt" ]; then
-            echo "Erreur : Le fichier NEXT_VERSION.txt est introuvable à la racine."
-            exit 1
+          # Initialisation de la variable
+          NEXT_VERSION_FROM_FILE=""
+          
+          # On essaie de lire le fichier s'il existe
+          if [ -f "NEXT_VERSION.txt" ]; then
+            NEXT_VERSION_FROM_FILE=$(cat NEXT_VERSION.txt | tr -d '[:space:]')
           fi
 
-          # On lit le contenu du fichier et on supprime les espaces ou sauts de ligne éventuels
-          NEW_BRANCH=$(cat NEXT_VERSION.txt | tr -d '[:space:]')
+          # LOGIQUE DE SÉCURITÉ :
+          # Si le fichier est vide OU s'il contient encore l'ancienne version
+          if [[ -z "$NEXT_VERSION_FROM_FILE" || "$NEXT_VERSION_FROM_FILE" == "$MERGED_BRANCH" ]]; then
+            echo "⚠️ ATTENTION : Le fichier NEXT_VERSION contient '$NEXT_VERSION_FROM_FILE' (identique à la version actuelle ou vide)."
+            echo "👉 Passage en mode AUTO-INCRÉMENTATION."
           
-          echo "Le nom de la prochaine branche de dev sera : $NEW_BRANCH"
+            # Logique mathématique pour vX.Y -> vX.(Y+1)
+            # 1. On enlève le "v"
+            VERSION_NUM="${MERGED_BRANCH#v}"
+            # 2. On sépare Majeur et Mineur (basé sur le point)
+            MAJOR="${VERSION_NUM%%.*}"
+            MINOR="${VERSION_NUM##*.}"
+            # 3. On incrémente le Mineur
+            NEW_MINOR=$((MINOR + 1))
+            # 4. On reconstruit
+            NEW_BRANCH="v${MAJOR}.${NEW_MINOR}"
+          else
+            echo "✅ Fichier NEXT_VERSION valide."
+            NEW_BRANCH="$NEXT_VERSION_FROM_FILE"
+          fi
 
-          # ---------------------------------------------------------
+          echo "🎯 La future branche de dev sera : $NEW_BRANCH"
+
+          # =========================================================
           # 4. CRÉATION DE LA NOUVELLE BRANCHE DE DEV
-          # ---------------------------------------------------------
-          # On s'assure d'être sur main et à jour
+          # =========================================================
+          echo "Préparation de la création de branche..."
+          
+          # CORRECTION CRITIQUE : On s'assure d'avoir les dernières infos distantes
+          git fetch origin main
+          
+          # On se place explicitement sur main (reset hard pour être sûr d'être propre)
           git checkout -B main origin/main
           
-          # On crée et pousse la nouvelle branche
+          # On crée la branche
           git checkout -b "$NEW_BRANCH"
+          
+          # On la pousse
+          echo "Push de la branche $NEW_BRANCH vers origin..."
           git push origin "$NEW_BRANCH"
 
-          # ---------------------------------------------------------
-          # 5. NETTOYAGE DES ANCIENNES BRANCHES (Garder N et N-1)
-          # ---------------------------------------------------------
-          echo "Vérification des anciennes branches à supprimer..."
-          
-          # On liste toutes les branches distantes qui commencent par "v" et on les trie
+          # =========================================================
+          # 5. NETTOYAGE DES ANCIENNES BRANCHES
+          # =========================================================
+          echo "Nettoyage des vieilles branches..."
+          # Liste des branches distantes v* triées par version décroissante
           BRANCHES=$(git branch -r --list "origin/v*" | sed 's/  origin\///' | sort -rV)
           BRANCH_ARRAY=($BRANCHES)
           
-          echo "Branches de dev actuellement sur le serveur :"
-          printf "%s\n" "${BRANCH_ARRAY[@]}"
-
-          # Si on a plus de 2 branches de version, on supprime les plus vieilles (à partir de l'index 2)
+          # On garde les 2 plus récentes (l'actuelle N et la précédente N-1)
           if [ ${#BRANCH_ARRAY[@]} -gt 2 ]; then
             for (( i=2; i<${#BRANCH_ARRAY[@]}; i++ )); do
               BRANCH_TO_DELETE="${BRANCH_ARRAY[$i]}"
-              echo "Suppression de l'ancienne branche : $BRANCH_TO_DELETE"
-              git push origin --delete "$BRANCH_TO_DELETE"
+              # Petite sécurité pour ne jamais supprimer main ou master par accident
+              if [[ "$BRANCH_TO_DELETE" != "main" && "$BRANCH_TO_DELETE" != "master" ]]; then
+                echo "Suppression de l'ancienne branche : $BRANCH_TO_DELETE"
+                git push origin --delete "$BRANCH_TO_DELETE"
+              fi
             done
           else
-            echo "Il y a 2 branches ou moins. Aucune suppression nécessaire."
+            echo "Rien à nettoyer (2 branches ou moins détectées)."
           fi
