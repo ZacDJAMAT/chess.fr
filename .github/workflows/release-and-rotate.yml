@@ -1,0 +1,99 @@
+name: release-and-rotate.yml
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+# Autorisations nécessaires pour que le bot GitHub puisse pousser du code et créer des releases
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release_and_rotate:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Récupère tout l'historique pour pouvoir lister les branches
+
+      - name: Configuration de Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Traitement du Tag, de la Release et des Branches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. RÉCUPÉRATION DE LA BRANCHE FUSIONNÉE
+          MERGED_BRANCH="${{ github.event.pull_request.head.ref }}"
+          
+          # On vérifie que c'est bien une branche de version (commence par "v")
+          if [[ "$MERGED_BRANCH" != v* ]]; then
+            echo "La branche $MERGED_BRANCH ne commence pas par 'v'. Arrêt du script."
+            exit 0
+          fi
+
+          echo "Branche fusionnée détectée : $MERGED_BRANCH"
+
+          # ---------------------------------------------------------
+          # 2. CRÉATION DE LA RELEASE SUR GITHUB
+          # ---------------------------------------------------------
+          echo "Création de la Release GitHub pour $MERGED_BRANCH..."
+          # L'outil 'gh' crée le tag sur main et génère une page de Release avec les notes automatiques
+          gh release create "$MERGED_BRANCH" --title "Version $MERGED_BRANCH" --generate-notes --target main
+
+          # ---------------------------------------------------------
+          # 3. LECTURE DU NOM DE LA NOUVELLE BRANCHE
+          # ---------------------------------------------------------
+          echo "Lecture du fichier NEXT_VERSION.txt..."
+          
+          # On vérifie que le fichier existe bien pour éviter un plantage
+          if [ ! -f "NEXT_VERSION.txt" ]; then
+            echo "Erreur : Le fichier NEXT_VERSION.txt est introuvable à la racine."
+            exit 1
+          fi
+
+          # On lit le contenu du fichier et on supprime les espaces ou sauts de ligne éventuels
+          NEW_BRANCH=$(cat NEXT_VERSION.txt | tr -d '[:space:]')
+          
+          echo "Le nom de la prochaine branche de dev sera : $NEW_BRANCH"
+
+          # ---------------------------------------------------------
+          # 4. CRÉATION DE LA NOUVELLE BRANCHE DE DEV
+          # ---------------------------------------------------------
+          # On s'assure d'être sur main et à jour
+          git checkout -B main origin/main
+          
+          # On crée et pousse la nouvelle branche
+          git checkout -b "$NEW_BRANCH"
+          git push origin "$NEW_BRANCH"
+
+          # ---------------------------------------------------------
+          # 5. NETTOYAGE DES ANCIENNES BRANCHES (Garder N et N-1)
+          # ---------------------------------------------------------
+          echo "Vérification des anciennes branches à supprimer..."
+          
+          # On liste toutes les branches distantes qui commencent par "v" et on les trie
+          BRANCHES=$(git branch -r --list "origin/v*" | sed 's/  origin\///' | sort -rV)
+          BRANCH_ARRAY=($BRANCHES)
+          
+          echo "Branches de dev actuellement sur le serveur :"
+          printf "%s\n" "${BRANCH_ARRAY[@]}"
+
+          # Si on a plus de 2 branches de version, on supprime les plus vieilles (à partir de l'index 2)
+          if [ ${#BRANCH_ARRAY[@]} -gt 2 ]; then
+            for (( i=2; i<${#BRANCH_ARRAY[@]}; i++ )); do
+              BRANCH_TO_DELETE="${BRANCH_ARRAY[$i]}"
+              echo "Suppression de l'ancienne branche : $BRANCH_TO_DELETE"
+              git push origin --delete "$BRANCH_TO_DELETE"
+            done
+          else
+            echo "Il y a 2 branches ou moins. Aucune suppression nécessaire."
+          fi
